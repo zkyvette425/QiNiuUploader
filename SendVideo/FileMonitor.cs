@@ -77,10 +77,36 @@ public class FileMonitor
                 // 检查文件是否可正常读取（避免处理未粘贴完成的文件）
                 if (IsFileReadyForProcessing(filePath))
                 {
-                    _record.AddNewFile(candidateFile);
-                    Console.WriteLine($"已将新文件 {candidateFile} 添加到数据库，状态为未上传");
+                    if (IsValidFileNameFormat(candidateFile))
+                    {
+                        _record.AddNewFile(candidateFile);
+                        Console.WriteLine($"已将新文件 {candidateFile} 添加到数据库，状态为未上传");
+                    }
+                    else
+                    {
+                        DeleteInvalidFile(filePath);
+                    }
                 }
             }
+        }
+    }
+    
+    private bool IsValidFileNameFormat(string fileName)
+    {
+        var parts = fileName.Split('_', 2);
+        return parts.Length == 2 && !string.IsNullOrEmpty(parts[0]) && !string.IsNullOrEmpty(parts[1]);
+    }
+
+    private void DeleteInvalidFile(string filePath)
+    {
+        try
+        {
+            File.Delete(filePath);
+            Console.WriteLine($"删除不符合格式的文件: {filePath}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"删除文件 {filePath} 时出错: {ex.Message}");
         }
     }
 
@@ -97,7 +123,7 @@ public class FileMonitor
         }
         catch (IOException)
         {
-            // 文件被占用，暂不处理
+            // 文件被占用（粘贴中），暂不处理
             return false;
         }
     }
@@ -106,15 +132,13 @@ public class FileMonitor
     {
         lock (_fileOperationLock)
         {
-            CleanInvalidUploadingStatus();
-            
-            // 检查是否有文件正在上传
-            if (_record.HasFileInUploadingStatus())
+            // 仅当存在 **有效** 上传中文件时（文件和进度文件都存在），才等待
+            if (HasValidUploadingFiles())
             {
-                Console.WriteLine("有文件正在上传，等待上传完成...");
+                Console.WriteLine("有文件正在有效续传，等待上传完成...");
                 return;
             }
-
+            
             // 优先处理中断上传的文件
             var interruptedFiles = _record.GetInterruptedFiles();
             foreach (var file in interruptedFiles)
@@ -131,6 +155,16 @@ public class FileMonitor
                 HandleFile(filePath, file.FileName, "未上传");
             }
         }
+    }
+    
+    // 新增：检查是否存在有效上传中文件（文件和进度文件均存在）
+    private bool HasValidUploadingFiles()
+    {
+        var uploadingFiles = _record.GetAllFiles().Where(f => f.Status == "上传中").ToList();
+        return uploadingFiles.Any(f => 
+            File.Exists(Path.Combine(_videoFolder, f.FileName)) && 
+            File.Exists(Path.Combine(_videoFolder, $"{f.FileName}.progress"))
+        );
     }
     
     /// <summary>
@@ -161,7 +195,7 @@ public class FileMonitor
             foreach (var file in uploadingFiles)
             {
                 _record.MarkFileAsInterrupted(file.FileName);
-                Console.WriteLine($"启动时重置上传中状态：{file.FileName} 为中断上传");
+                Console.WriteLine($"启动时将上传中状态的文件 {file.FileName} 重置为上传中断");
             }
         }
     }
@@ -183,45 +217,61 @@ public class FileMonitor
 
     private void TryUploadFile(string filePath, string key)
     {
+        string originalKey = key;
+        int dotIndex = originalKey.LastIndexOf('.');
+        string baseName = dotIndex > 0 ? originalKey.Substring(0, dotIndex) : originalKey;
+        string extension = dotIndex > 0 ? originalKey.Substring(dotIndex) : "";
+    
+        string[] parts = baseName.Split('_', 2);
+        if (parts.Length == 2 && !string.IsNullOrEmpty(parts[0]) && !string.IsNullOrEmpty(parts[1]))
+        {
+            key = $"{parts[0]}/{parts[1]}{extension}"; // 保留扩展名（如 A/B.ext）
+        }
+        else
+        {
+            // 无效格式，按需求处理（如记录错误，不上传）
+            Console.WriteLine($"无效文件名格式 {originalKey}，应为 A_B.ext");
+            return;
+        }
         int maxRetries = 3;
         for (int retry = 0; retry < maxRetries; retry++)
         {
             try
             {
-                Console.WriteLine($"开始上传文件: {key}");
-                
-                _record.MarkFileAsUploading(key); // 标记为上传中
-                HttpResult result = _uploader.UploadFile(filePath, key);
+                // 在上传文件前打印文件名称
+                Console.WriteLine($"即将开始上传文件: {originalKey}，上传的 key 为: {key}");
+
+                _record.MarkFileAsUploading(originalKey);
+                HttpResult result = _uploader.UploadFile(filePath,originalKey,key);
 
                 if (result.Code == 200)
                 {
-                    _record.MarkFileAsUploaded(key);
-                    DeleteProgressFile(key);
-                    Console.WriteLine($"文件 {key} 上传成功，已删除对应的 .progress 文件");
-                    return; // 成功时提前退出
+                    _record.MarkFileAsUploaded(originalKey);
+                    DeleteProgressFile(originalKey);
+                    Console.WriteLine($"文件 {originalKey} 上传成功，已删除对应的 .progress 文件");
                 }
                 else
                 {
-                    Console.WriteLine($"上传失败（状态码 {result.Code}），重试 {retry + 1}/{maxRetries}");
+                    _record.MarkFileAsInterrupted(originalKey);
+                }
+                Console.WriteLine($"文件 {originalKey} 上传结果: {result.ToString()}");
+                return;
+            }
+            catch (IOException ex)
+            {
+                Console.WriteLine($"上传 {filePath} 时出现 I/O 异常，重试 {retry + 1}/{maxRetries}: {ex.Message}");
+                if (retry == maxRetries - 1)
+                {
+                    _record.MarkFileAsInterrupted(originalKey);
+                    Console.WriteLine($"文件 {originalKey} 上传失败，达到最大重试次数。");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"上传异常（重试 {retry + 1}/{maxRetries}）: {ex.Message}");
-            }
-
-            // 单次失败后，清除“上传中”状态（避免数据库残留）
-            _record.MarkFileAsInterrupted(key); 
-
-            // 非最后一次重试时，添加退避时间（可选，提升稳定性）
-            if (retry < maxRetries - 1)
-            {
-                Thread.Sleep(TimeSpan.FromSeconds(1 << retry)); // 1s → 2s → 4s 退避
+                _record.MarkFileAsInterrupted(originalKey);
+                Console.WriteLine($"文件 {originalKey} 上传失败: {ex.Message}");
             }
         }
-
-        // 所有重试失败后，最终标记为中断
-        Console.WriteLine($"文件 {key} 上传失败，达到最大重试次数（{maxRetries} 次）");
     }
 
     private void DeleteProgressFile(string key)
